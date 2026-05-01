@@ -247,8 +247,9 @@ def main():
             # Make image paths absolute for WeasyPrint
             cwd = os.getcwd()
             # WeasyPrint requires the base_url to resolve relative paths
-            # Path conversion for thumbnails to absolute file:// URIs
-            md_for_pdf = md_content.replace('](' + thumbs_dir + '/', '](' + f'file://{cwd}/{thumbs_dir}/')
+            # Path conversion for thumbnails: remove relative path prefix
+            # and let WeasyPrint find them via the base_url.
+            md_for_pdf = md_content.replace('](' + thumbs_dir + '/', '](')
             
             html_content = md.render(md_for_pdf)
             
@@ -273,8 +274,8 @@ def main():
             </html>
             """
             
-            # Use the absolute path as base_url to help WeasyPrint find images
-            HTML(string=styled_html, base_url=cwd).write_pdf(filename_pdf)
+            # Use the absolute path to the directory containing images as base_url
+            HTML(string=styled_html, base_url=os.path.join(cwd, thumbs_dir)).write_pdf(filename_pdf)
             print(f"Success: PDF saved to {filename_pdf}")
 
         # Report Statistics to Console

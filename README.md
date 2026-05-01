@@ -5,10 +5,11 @@ A sophisticated YouTube transcript downloader and summarizer that generates rich
 ## Features
 -   **Multi-format Input**: Extract transcripts using full YouTube URLs, shortened `youtu.be` links, or direct Video IDs.
 -   **AI Summarization**: Automatically generates concise summaries using **Gemma v4** (via Google Gemini API).
--   **Rich Markdown Output**: Creates a detailed `.md` file for every video.
+-   **Rich Markdown & PDF Output**: Creates detailed `.md` and `.pdf` files for every video with embedded imagery.
 -   **Visual Timestamps**: 
     -   Includes clickable links to jump to specific moments on YouTube.
-    -   Extracts and embeds unique timestamped frames (every ~30 seconds) using `ffmpeg` and `yt-dlp` for precise visual context.
+    -   Extracts and embeds unique timestamped frames (every ~60 seconds) using `ffmpeg` and `yt-dlp` for precise visual context.
+-   **Execution Statistics**: Tracks and reports FFmpeg processing time and AI token usage.
 -   **Clean Formatting**: Removes unnecessary newlines and whitespace for a polished reading experience.
 
 ## Installation
@@ -17,6 +18,7 @@ A sophisticated YouTube transcript downloader and summarizer that generates rich
 -   Python 3.12+
 -   **FFmpeg**: Required for precise frame extraction.
 -   A Google Gemini API Key (for Gemma v4 summarization).
+-   **System Libraries for WeasyPrint**: (On Ubuntu) `sudo apt install -y libpango-1.0-0 libharfbuzz0b libpangoft2-1.0-0`
 
 ### Setup
 1.  Clone the repository or download the script.
@@ -26,7 +28,7 @@ A sophisticated YouTube transcript downloader and summarizer that generates rich
     ```
 3.  Install Python dependencies:
     ```bash
-    pip install youtube-transcript-api google-generativeai python-dotenv requests yt-dlp
+    pip install youtube-transcript-api google-genai python-dotenv requests yt-dlp weasyprint markdown-it-py
     ```
 4.  Configure your API key:
     Create a `.env` file in the root directory and add your key:
@@ -46,6 +48,11 @@ python pysummary.py "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 ### Using a Video ID
 ```bash
 python pysummary.py dQw4w9WgXcQ
+```
+
+### Generating a PDF Report
+```bash
+python pysummary.py -pdf dQw4w9WgXcQ
 ```
 
 ### 🎬 Example Output (dQw4w9WgXcQ)
