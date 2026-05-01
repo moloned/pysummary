@@ -158,8 +158,8 @@ def main():
         # Format transcript with timestamps
         formatted_lines = []
         # Limiting thumbnails to avoid too many downloads for long videos
-        # We can take a thumbnail every 30 seconds or so
-        last_thumb_time = -40 
+        # We can take a thumbnail every 60 seconds or so
+        last_thumb_time = -70 
 
         for segment in data:
             start_time = segment['start']
@@ -168,30 +168,15 @@ def main():
             hours, minutes = divmod(minutes, 60)
             
             if hours > 0:
-                timestamp = f"[{hours:02d}:{minutes:02d}:{seconds:02d}]"
+                timestamp_str = f"[{hours:02d}:{minutes:02d}:{seconds:02d}]"
             else:
-                timestamp = f"[{minutes:02d}:{seconds:02d}]"
+                timestamp_str = f"[{minutes:02d}:{seconds:02d}]"
                 
             jump_url = f"https://youtu.be/{vid_id}?t={int(start_time)}"
             text = segment['text'].replace('\n', ' ').strip()
             
-            line = f"{timestamp} {text} ([link]({jump_url}))"
-            
-            # Simple heuristic to include a thumbnail every ~30 seconds
-            if start_time - last_thumb_time >= 30:
-                # Note: YouTube doesn't allow random frame extraction via simple URL.
-                # However, many people use this trick with a specific pattern if available,
-                # but standardly only hqdefault/mqdefault/maxresdefault exist.
-                # For per-timestamp thumbnails, typically one needs to download the video 
-                # or use storyboard URLs. storyboard URLs are complex.
-                # Instead, we'll download the MQ thumbnail for the video as a placeholder 
-                # or acknowledge the limitation if it's not possible without complex logic.
-                #
-                # ACTUALLY, I will download the HQ thumbnail as a representative image 
-                # for the section if I can find a way, but since YouTube only provides 
-                # static thumbnails, I'll just save the main one in the folder 
-                # and link it periodically in the MD.
-                
+            # Simple heuristic to include a thumbnail every ~60 seconds
+            if start_time - last_thumb_time >= 60:
                 thumb_name = f"thumb_{int(start_time)}.jpg"
                 thumb_path = os.path.join(thumbs_dir, thumb_name)
                 
@@ -206,10 +191,10 @@ def main():
                             with open(thumb_path, 'wb') as f:
                                 f.write(r.content)
                 
-                line = f"![{timestamp}]({thumb_path})\n\n{line}"
+                formatted_lines.append(f"![{timestamp_str}]({thumb_path})\n")
                 last_thumb_time = start_time
-
-            formatted_lines.append(line)
+            
+            formatted_lines.append(f"{timestamp_str} {text} ([link]({jump_url}))")
 
         output_content = '\n'.join(formatted_lines)
         
