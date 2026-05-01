@@ -52,8 +52,10 @@ python pysummary.py dQw4w9WgXcQ
 > This transcript consists of the lyrics to Rick Astley's "Never Gonna Give You Up," a song about unwavering loyalty and commitment to a romantic partner.
 
 #### Transcript Preview with Timestamps
+![[00:01]](thumbs_dQw4w9WgXcQ/thumb_1.jpg)
 **[00:01]** [♪♪♪] ([link](https://youtu.be/dQw4w9WgXcQ?t=1))
 
+![[00:35]](thumbs_dQw4w9WgXcQ/thumb_35.jpg)
 **[00:35]** ♪ I just wanna tell you how I'm feeling ♪ ([link](https://youtu.be/dQw4w9WgXcQ?t=35))
 
 ## Output

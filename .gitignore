@@ -11,7 +11,7 @@ ENV/
 
 # Project Specific
 transcript_*.md
-thumbs_*/
+# thumbs_*/  <-- Commented out to allow example images to be uploaded
 
 # IDEs
 .vscode/
