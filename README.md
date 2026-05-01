@@ -67,8 +67,8 @@ python pysummary.py -pdf dQw4w9WgXcQ
 ![[00:01]](thumbs_dQw4w9WgXcQ/thumb_1.jpg)
 **[00:01]** [♪♪♪] ([link](https://youtu.be/dQw4w9WgXcQ?t=1))
 
-![[00:35]](thumbs_dQw4w9WgXcQ/thumb_35.jpg)
-**[00:35]** ♪ I just wanna tell you how I'm feeling ♪ ([link](https://youtu.be/dQw4w9WgXcQ?t=35))
+![[01:04]](thumbs_dQw4w9WgXcQ/thumb_64.jpg)
+**[01:04]** ♪ Your heart's been aching but you're too shy to say it ♪ ([link](https://youtu.be/dQw4w9WgXcQ?t=64))
 
 ## Output
 The script generates two main outputs:
