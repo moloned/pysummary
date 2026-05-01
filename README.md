@@ -6,9 +6,12 @@ A sophisticated YouTube transcript downloader and summarizer that generates rich
 -   **Multi-format Input**: Extract transcripts using full YouTube URLs, shortened `youtu.be` links, or direct Video IDs.
 -   **AI Summarization**: Automatically generates concise summaries using **Gemma v4** (via Google Gemini API).
 -   **Rich Markdown & PDF Output**: Creates detailed `.md` and `.pdf` files for every video with embedded imagery.
+-   **PowerPoint Generation**: Generates `.pptx` presentations with visual slides, speaker notes, and timestamp ranges.
 -   **Visual Timestamps**: 
     -   Includes clickable links to jump to specific moments on YouTube.
     -   Extracts and embeds unique timestamped frames (every ~60 seconds) using `ffmpeg` and `yt-dlp` for precise visual context.
+-   **Interactive Ranges**: PowerPoint slides feature clickable timestamp ranges linked to YouTube.
+-   **Custom Filenames**: Use the `-name` flag to specify human-readable file names.
 -   **Execution Statistics**: Tracks and reports FFmpeg processing time and AI token usage.
 -   **Clean Formatting**: Removes unnecessary newlines and whitespace for a polished reading experience.
 
@@ -28,6 +31,37 @@ A sophisticated YouTube transcript downloader and summarizer that generates rich
     ```
 3.  Install Python dependencies:
     ```bash
+    pip install google-genai youtube-transcript-api yt-dlp markdown-it-py WeasyPrint python-pptx requests
+    ```
+4.  Set your Gemini API Key as an environment variable:
+    ```bash
+    export GEMINI_API_KEY="your-api-key-here"
+    ```
+
+## Usage
+
+Basic usage with Markdown output:
+```bash
+python pysummary.py dQw4w9WgXcQ
+```
+
+Generate a PowerPoint with custom naming:
+```bash
+python pysummary.py -ppt -name "Rick Astley - Never Gonna Give You Up" dQw4w9WgXcQ
+```
+
+Advanced usage (PDF + PPT + Skip N thumbnails):
+```bash
+python pysummary.py -pdf -ppt -n 2 dQw4w9WgXcQ
+```
+
+### Arguments
+-   `video_id_or_url`: YouTube Video ID or URL.
+-   `-pdf`: Generate PDF output.
+-   `-ppt`: Generate PowerPoint output.
+-   `-name "FILENAME"`: Specify a custom filename (default uses video ID).
+-   `-n X`: Skip first X thumbnails (useful for intro/black screens).
+-   `-v`: Verbose output (show FFmpeg logs).
     pip install youtube-transcript-api google-genai python-dotenv requests yt-dlp weasyprint markdown-it-py
     ```
 4.  Configure your API key:
@@ -50,9 +84,14 @@ python pysummary.py "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 python pysummary.py dQw4w9WgXcQ
 ```
 
-### Generating a PDF Report
+### Generating a PowerPoint Presentation
 ```bash
-python pysummary.py -pdf dQw4w9WgXcQ
+python pysummary.py -ppt dQw4w9WgXcQ
+```
+
+### Full Multi-format Export with Custom Name
+```bash
+python pysummary.py dQw4w9WgXcQ -pdf -name "Never Gonna Give You Up" -ppt
 ```
 
 ### 🎬 Example Output (dQw4w9WgXcQ)
