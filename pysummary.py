@@ -4,12 +4,23 @@ import os
 import requests
 import yt_dlp
 import subprocess
+import time
 from dotenv import load_dotenv
-import google.generativeai as genai
+from google import genai
 from youtube_transcript_api import YouTubeTranscriptApi as yta
+from markdown_it import MarkdownIt
+from weasyprint import HTML
 
 # Load environment variables (for API key)
 load_dotenv()
+
+# Global statistics
+stats = {
+    "ffmpeg_total_time": 0.0,
+    "ffmpeg_calls": 0,
+    "tokens_prompt": 0,
+    "tokens_response": 0
+}
 
 def get_video_id(input_str):
     """
@@ -38,12 +49,19 @@ def generate_summary(text):
         return "Summary not generated: GEMINI_API_KEY environment variable not found."
 
     try:
-        genai.configure(api_key=api_key)
+        client = genai.Client(api_key=api_key)
         # Using the specific Gemma model requested: gemma-4-31b-it
-        model = genai.GenerativeModel('models/gemma-4-31b-it') 
-        
         prompt = f"Please provide a concise summary of the following YouTube transcript:\n\n{text}"
-        response = model.generate_content(prompt)
+        response = client.models.generate_content(
+            model='models/gemma-4-31b-it',
+            contents=prompt
+        )
+        
+        # Track tokens if metadata is available
+        if hasattr(response, 'usage_metadata'):
+            stats["tokens_prompt"] += response.usage_metadata.prompt_token_count
+            stats["tokens_response"] += response.usage_metadata.candidates_token_count
+            
         return response.text
     except Exception as e:
         return f"Error generating summary: {e}"
@@ -91,18 +109,29 @@ def extract_frame(video_id, timestamp, output_path):
                 output_path, 
                 '-y'
             ]
+            
+            start_time = time.time()
             subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            duration = time.time() - start_time
+            
+            stats["ffmpeg_total_time"] += duration
+            stats["ffmpeg_calls"] += 1
+            
             return os.path.exists(output_path)
     except Exception as e:
         print(f"Frame extraction failed for {timestamp}s: {e}")
         return False
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python pysummary.py <YouTube URL or Video ID>")
+    # Parse arguments
+    generate_pdf = "-pdf" in sys.argv
+    args = [arg for arg in sys.argv[1:] if arg != "-pdf"]
+
+    if not args:
+        print("Usage: python pysummary.py [-pdf] <YouTube URL or Video ID>")
         sys.exit(1)
 
-    input_arg = sys.argv[1]
+    input_arg = args[0]
     vid_id = get_video_id(input_arg)
 
     if not vid_id:
@@ -194,17 +223,91 @@ def main():
         summary = generate_summary(full_text)
         print(summary)
         
+        # Prepare Statistics Block
+        stats_block = f"""
+---
+### Execution Statistics
+- **FFmpeg Total Runtime**: {stats['ffmpeg_total_time']:.2f} seconds
+- **FFmpeg Frames Extracted**: {stats['ffmpeg_calls']}
+"""
+        if stats['tokens_prompt'] > 0:
+            stats_block += f"- **AI Tokens Used**: {stats['tokens_prompt'] + stats['tokens_response']} (Prompt: {stats['tokens_prompt']}, Response: {stats['tokens_response']})\n"
+        else:
+            stats_block += "- **AI Tokens Used**: N/A (Response metadata not provided)\n"
+
         # Output to .md file
-        filename = f"transcript_{vid_id}.md"
-        with open(filename, "w", encoding="utf-8") as f:
+        filename_md = f"transcript_{vid_id}.md"
+        with open(filename_md, "w", encoding="utf-8") as f:
             f.write(f"# Transcript and Summary for YouTube Video: {vid_id}\n\n")
             f.write(f"{main_thumbnail}\n\n")
             f.write("## Summary\n")
             f.write(f"{summary}\n\n")
             f.write("## Transcript\n")
             f.write(output_content)
+            f.write(stats_block)
         
-        print(f"\nSuccess: Transcript and Summary saved to {filename}")
+        print(f"\nSuccess: Transcript and Summary saved to {filename_md}")
+
+        # PDF Generation
+        if generate_pdf:
+            print("\n--- Generating PDF ---")
+            filename_pdf = f"transcript_{vid_id}.pdf"
+            
+            # Use markdown-it-py to convert MD to HTML
+            md = MarkdownIt("commonmark", {
+                "html": True,
+                "linkify": True,
+            })
+            
+            # We need to make image paths absolute for WeasyPrint
+            cwd = os.getcwd()
+            md_content = f"""
+# Transcript and Summary for YouTube Video: {vid_id}
+
+<img src="https://img.youtube.com/vi/{vid_id}/maxresdefault.jpg" style="width: 100%; max-width: 800px; display: block; margin: 0 auto;">
+
+## Summary
+{summary}
+
+## Transcript
+{output_content.replace('](' + thumbs_dir + '/', '](' + 'file://' + os.path.join(cwd, thumbs_dir) + '/')}
+
+{stats_block}
+"""
+            html_content = md.render(md_content)
+            
+            # Simple CSS for the PDF
+            styled_html = f"""
+            <html>
+                <head>
+                    <style>
+                        body {{ font-family: sans-serif; line-height: 1.6; color: #333; max-width: 800px; margin: 40px auto; padding: 0 20px; }}
+                        h1 {{ color: #1a73e8; text-align: center; }}
+                        h2 {{ color: #444; border-bottom: 1px solid #ddd; padding-bottom: 10px; margin-top: 30px; }}
+                        blockquote {{ background: #f9f9f9; border-left: 5px solid #ccc; margin: 1.5em 10px; padding: 0.5em 10px; font-style: italic; }}
+                        img {{ max-width: 100%; height: auto; border-radius: 4px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin: 20px 0; }}
+                        .timestamp {{ font-weight: bold; color: #555; }}
+                        a {{ color: #1a73e8; text-decoration: none; }}
+                        p {{ margin-bottom: 1.5em; }}
+                    </style>
+                </head>
+                <body>
+                    {html_content}
+                </body>
+            </html>
+            """
+            
+            HTML(string=styled_html, base_url=cwd).write_pdf(filename_pdf)
+            print(f"Success: PDF saved to {filename_pdf}")
+
+        # Report Statistics to Console
+        print("\n--- Execution Statistics ---")
+        print(f"FFmpeg Total Runtime: {stats['ffmpeg_total_time']:.2f} seconds")
+        print(f"FFmpeg Frames Extracted: {stats['ffmpeg_calls']}")
+        if stats['tokens_prompt'] > 0:
+            print(f"AI Tokens Used: {stats['tokens_prompt'] + stats['tokens_response']} (Prompt: {stats['tokens_prompt']}, Response: {stats['tokens_response']})")
+        else:
+            print("AI Tokens Used: N/A (Response metadata not provided)")
 
     except Exception as e:
         print(f"Error fetching transcript: {e}")
