@@ -2,6 +2,8 @@ import sys
 import re
 import os
 import requests
+import yt_dlp
+import subprocess
 from dotenv import load_dotenv
 import google.generativeai as genai
 from youtube_transcript_api import YouTubeTranscriptApi as yta
@@ -45,6 +47,55 @@ def generate_summary(text):
         return response.text
     except Exception as e:
         return f"Error generating summary: {e}"
+
+def extract_frame(video_id, timestamp, output_path):
+    """
+    Extracts a single frame from the YouTube video stream at the specified timestamp.
+    Requires yt-dlp. ffmpeg or other tools may be needed by yt-dlp.
+    """
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    
+    # We use yt-dlp to get the URL of the best image/video stream and then use it
+    # However, a simpler way is to use yt-dlp's frame extraction if available
+    # Or just use the --get-url and pass to a tool.
+    # Given the environment, we'll try yt-dlp with --skip-download and --write-thumbnail 
+    # but that's for the main thumbnail. 
+    # For a specific timestamp, we can use the following command structure:
+    # yt-dlp -g -f bestvideo [URL] 
+    # then ffmpeg -ss [time] -i [url] -vframes 1 [output]
+    
+    ydl_opts = {
+        'format': 'bestvideo',
+        'quiet': True,
+        'no_warnings': True,
+    }
+    
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            stream_url = info['url']
+            
+            # Use subprocess to call ffmpeg if available, 
+            # or try yt-dlp's internal extraction if possible.
+            # Since ffmpeg might not be directly in PATH but might be available to yt-dlp,
+            # we'll try a common ffmpeg command via subprocess.
+            # If ffmpeg is missing (checked earlier and failed), we might need an alternative.
+            # But let's try calling it anyway to be sure, or use a fallback.
+            
+            cmd = [
+                'ffmpeg', 
+                '-ss', str(timestamp), 
+                '-i', stream_url, 
+                '-vframes', '1', 
+                '-q:v', '2', 
+                output_path, 
+                '-y'
+            ]
+            subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            return os.path.exists(output_path)
+    except Exception as e:
+        print(f"Frame extraction failed for {timestamp}s: {e}")
+        return False
 
 def main():
     if len(sys.argv) < 2:
@@ -115,18 +166,16 @@ def main():
                 thumb_name = f"thumb_{int(start_time)}.jpg"
                 thumb_path = os.path.join(thumbs_dir, thumb_name)
                 
-                # If we don't have a direct per-second API, we just reuse the main thumbnail 
-                # or a specific index if provided. 
-                # Since we can't easily get per-second frames without yt-dlp+ffmpeg,
-                # I'll just link to the Jump URL with the text for now, but 
-                # I'll download the main thumbnail once into the folder as requested.
-                
                 if not os.path.exists(thumb_path):
-                    # Downloading maxresdefault once
-                    r = requests.get(f"https://img.youtube.com/vi/{vid_id}/hqdefault.jpg")
-                    if r.status_code == 200:
-                        with open(thumb_path, 'wb') as f:
-                            f.write(r.content)
+                    # Try to extract the real frame from the video stream
+                    success = extract_frame(vid_id, int(start_time), thumb_path)
+                    
+                    # Fallback to HQ thumbnail if extraction fails
+                    if not success:
+                        r = requests.get(f"https://img.youtube.com/vi/{vid_id}/hqdefault.jpg")
+                        if r.status_code == 200:
+                            with open(thumb_path, 'wb') as f:
+                                f.write(r.content)
                 
                 line = f"![{timestamp}]({thumb_path})\n\n{line}"
                 last_thumb_time = start_time

@@ -8,22 +8,27 @@ A sophisticated YouTube transcript downloader and summarizer that generates rich
 -   **Rich Markdown Output**: Creates a detailed `.md` file for every video.
 -   **Visual Timestamps**: 
     -   Includes clickable links to jump to specific moments on YouTube.
-    -   Downloads and embeds timestamped thumbnails (every ~30 seconds) into the document for visual context.
+    -   Extracts and embeds unique timestamped frames (every ~30 seconds) using `ffmpeg` and `yt-dlp` for precise visual context.
 -   **Clean Formatting**: Removes unnecessary newlines and whitespace for a polished reading experience.
 
 ## Installation
 
 ### Prerequisites
 -   Python 3.12+
+-   **FFmpeg**: Required for precise frame extraction.
 -   A Google Gemini API Key (for Gemma v4 summarization).
 
 ### Setup
 1.  Clone the repository or download the script.
-2.  Install dependencies:
+2.  Install FFmpeg (on Ubuntu/Linux):
     ```bash
-    pip install youtube-transcript-api google-generativeai python-dotenv requests
+    sudo apt update && sudo apt install -y ffmpeg
     ```
-3.  Configure your API key:
+3.  Install Python dependencies:
+    ```bash
+    pip install youtube-transcript-api google-generativeai python-dotenv requests yt-dlp
+    ```
+4.  Configure your API key:
     Create a `.env` file in the root directory and add your key:
     ```bash
     GEMINI_API_KEY=your_api_key_here
