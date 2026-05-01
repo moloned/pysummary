@@ -222,14 +222,14 @@ def main():
 
         # Output to .md file
         filename_md = f"transcript_{vid_id}.md"
+        md_content = f"# Transcript and Summary for YouTube Video: {vid_id}\n\n" \
+                     f"{main_thumbnail}\n\n" \
+                     f"## Summary\n{summary}\n\n" \
+                     f"## Transcript\n{output_content}\n" \
+                     f"{stats_block}"
+        
         with open(filename_md, "w", encoding="utf-8") as f:
-            f.write(f"# Transcript and Summary for YouTube Video: {vid_id}\n\n")
-            f.write(f"{main_thumbnail}\n\n")
-            f.write("## Summary\n")
-            f.write(f"{summary}\n\n")
-            f.write("## Transcript\n")
-            f.write(output_content)
-            f.write(stats_block)
+            f.write(md_content)
         
         print(f"\nSuccess: Transcript and Summary saved to {filename_md}")
 
@@ -238,28 +238,19 @@ def main():
             print("\n--- Generating PDF ---")
             filename_pdf = f"transcript_{vid_id}.pdf"
             
-            # Use markdown-it-py to convert MD to HTML
+            # Use markdown-it-py to convert the EXSTING MD content to HTML
             md = MarkdownIt("commonmark", {
                 "html": True,
                 "linkify": True,
             })
             
-            # We need to make image paths absolute for WeasyPrint
+            # Make image paths absolute for WeasyPrint
             cwd = os.getcwd()
-            md_content = f"""
-# Transcript and Summary for YouTube Video: {vid_id}
-
-<img src="https://img.youtube.com/vi/{vid_id}/maxresdefault.jpg" style="width: 100%; max-width: 800px; display: block; margin: 0 auto;">
-
-## Summary
-{summary}
-
-## Transcript
-{output_content.replace('](' + thumbs_dir + '/', '](' + 'file://' + os.path.join(cwd, thumbs_dir) + '/')}
-
-{stats_block}
-"""
-            html_content = md.render(md_content)
+            # WeasyPrint requires the base_url to resolve relative paths
+            # Path conversion for thumbnails to absolute file:// URIs
+            md_for_pdf = md_content.replace('](' + thumbs_dir + '/', '](' + f'file://{cwd}/{thumbs_dir}/')
+            
+            html_content = md.render(md_for_pdf)
             
             # Simple CSS for the PDF
             styled_html = f"""
@@ -270,7 +261,7 @@ def main():
                         h1 {{ color: #1a73e8; text-align: center; }}
                         h2 {{ color: #444; border-bottom: 1px solid #ddd; padding-bottom: 10px; margin-top: 30px; }}
                         blockquote {{ background: #f9f9f9; border-left: 5px solid #ccc; margin: 1.5em 10px; padding: 0.5em 10px; font-style: italic; }}
-                        img {{ max-width: 100%; height: auto; border-radius: 4px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin: 20px 0; }}
+                        img {{ max-width: 100%; height: auto; border-radius: 4px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin: 20px 0; display: block; }}
                         .timestamp {{ font-weight: bold; color: #555; }}
                         a {{ color: #1a73e8; text-decoration: none; }}
                         p {{ margin-bottom: 1.5em; }}
@@ -282,6 +273,7 @@ def main():
             </html>
             """
             
+            # Use the absolute path as base_url to help WeasyPrint find images
             HTML(string=styled_html, base_url=cwd).write_pdf(filename_pdf)
             print(f"Success: PDF saved to {filename_pdf}")
 
