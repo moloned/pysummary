@@ -1,6 +1,6 @@
 # PySummary
 
-A tool for processing YouTube transcripts that produces timestamped reports, AI-generated summaries, and visual thumbnails across multiple file formats.
+A tool for processing YouTube videos & transcripts that produces timestamped reports, AI-generated summaries, and visual thumbnails across multiple formats including markdown, pdf and powerpoint.
 
 ## Features
 -   **Transcript Processing**: Retrieves transcripts from YouTube URLs, shortened links, or video IDs.
