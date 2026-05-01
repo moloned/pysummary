@@ -40,7 +40,7 @@ def get_video_id(input_str):
         
     return None
 
-def generate_summary(text):
+def generate_summary(text, segment=False):
     """
     Generates a summary of the transcript using Gemma (via Google Generative AI).
     Supports either an API key or a local setup if configured.
@@ -53,7 +53,11 @@ def generate_summary(text):
     try:
         client = genai.Client(api_key=api_key)
         # Using the specific Gemma model requested: gemma-4-31b-it
-        prompt = f"Please provide a concise summary of the following YouTube transcript:\n\n{text}"
+        if segment:
+            prompt = f"Please provide a very brief, one-sentence summary of this specific video segment transcript:\n\n{text}"
+        else:
+            prompt = f"Please provide a concise summary of the following YouTube transcript:\n\n{text}"
+            
         response = client.models.generate_content(
             model='models/gemma-4-31b-it',
             contents=prompt
@@ -434,7 +438,13 @@ def main():
                 # Add timestamp and text to speaker notes
                 notes_slide = slide.notes_slide
                 text_frame = notes_slide.notes_text_frame
-                text_frame.text = f"Range: {slide_data['start_timestamp']} - {slide_data['end_timestamp']}\n\n{slide_data['text']}"
+                
+                print(f"  Generating summary for slide {slide_data['start_timestamp']}...")
+                segment_summary = generate_summary(slide_data['text'], segment=True)
+                
+                text_frame.text = f"Range: {slide_data['start_timestamp']} - {slide_data['end_timestamp']}\n\n" \
+                                f"Segment Summary: {segment_summary}\n\n" \
+                                f"Transcript: {slide_data['text']}"
             
             # --- Statistics Slide ---
             stats_slide_layout = prs.slide_layouts[1]

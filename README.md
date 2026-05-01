@@ -8,7 +8,8 @@ A tool for processing YouTube videos & transcripts that produces timestamped rep
 -   **Multi-format Export**: Supports Markdown, PDF (via WeasyPrint), and PowerPoint (via python-pptx) output.
 -   **Automated Frame Extraction**: Uses FFmpeg and yt-dlp to extract video frames at regular intervals (approximately every 60 seconds).
 -   **Interactive Timestamps**: Includes direct links to specific video moments in Markdown and PDF reports.
--   **PowerPoint Integration**: Creates slides with extracted imagery, speaker notes containing segment text, and clickable timestamp ranges.
+-   **PowerPoint Integration**: Creates slides with extracted imagery, clickable timestamp ranges, and speaker notes featuring **AI-generated segment summaries** alongside the full transcript.
+-   **Segment-Level Summarization**: Automatically generates concise, one-sentence summaries for every visual segment in the PowerPoint speaker notes.
 -   **Customization**: Supports user-defined filenames and the ability to skip initial thumbnails.
 -   **Technical Metrics**: Provides data on FFmpeg execution time and AI token consumption.
 -   **Content Formatting**: Consolidates layout by removing excessive whitespace and newlines from the source transcript.
