@@ -1,19 +1,17 @@
 # PySummary
 
-A sophisticated YouTube transcript downloader and summarizer that generates rich, timestamped Markdown reports with AI-driven summaries and visual thumbnails.
+A tool for processing YouTube transcripts that produces timestamped reports, AI-generated summaries, and visual thumbnails across multiple file formats.
 
 ## Features
--   **Multi-format Input**: Extract transcripts using full YouTube URLs, shortened `youtu.be` links, or direct Video IDs.
--   **AI Summarization**: Automatically generates concise summaries using **Gemma v4** (via Google Gemini API).
--   **Rich Markdown & PDF Output**: Creates detailed `.md` and `.pdf` files for every video with embedded imagery.
--   **PowerPoint Generation**: Generates `.pptx` presentations with visual slides, speaker notes, and timestamp ranges.
--   **Visual Timestamps**: 
-    -   Includes clickable links to jump to specific moments on YouTube.
-    -   Extracts and embeds unique timestamped frames (every ~60 seconds) using `ffmpeg` and `yt-dlp` for precise visual context.
--   **Interactive Ranges**: PowerPoint slides feature clickable timestamp ranges linked to YouTube.
--   **Custom Filenames**: Use the `-name` flag to specify human-readable file names.
--   **Execution Statistics**: Tracks and reports FFmpeg processing time and AI token usage.
--   **Clean Formatting**: Removes unnecessary newlines and whitespace for a polished reading experience.
+-   **Transcript Processing**: Retrieves transcripts from YouTube URLs, shortened links, or video IDs.
+-   **Summarization**: Generates summaries using the Google Gemini API.
+-   **Multi-format Export**: Supports Markdown, PDF (via WeasyPrint), and PowerPoint (via python-pptx) output.
+-   **Automated Frame Extraction**: Uses FFmpeg and yt-dlp to extract video frames at regular intervals (approximately every 60 seconds).
+-   **Interactive Timestamps**: Includes direct links to specific video moments in Markdown and PDF reports.
+-   **PowerPoint Integration**: Creates slides with extracted imagery, speaker notes containing segment text, and clickable timestamp ranges.
+-   **Customization**: Supports user-defined filenames and the ability to skip initial thumbnails.
+-   **Technical Metrics**: Provides data on FFmpeg execution time and AI token consumption.
+-   **Content Formatting**: Consolidates layout by removing excessive whitespace and newlines from the source transcript.
 
 ## Installation
 
