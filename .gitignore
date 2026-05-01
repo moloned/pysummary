@@ -11,6 +11,8 @@ ENV/
 
 # Project Specific
 transcript_*.md
+transcript_*.pdf
+*.pdf
 # thumbs_*/  <-- Commented out to allow example images to be uploaded
 
 # IDEs
