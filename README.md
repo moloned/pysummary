@@ -8,7 +8,7 @@ PySummary extracts YouTube transcripts, segments the video timeline, generates A
 - Multi-format export: Markdown, PDF, PowerPoint
 - Chapter-aware workflow:
   - If chapters exist, PySummary uses them as segment boundaries
-  - If chapters do not exist, PySummary uses PySceneDetect scene boundaries
+  - If chapters do not exist, PySummary runs scene detection (PySceneDetect by default, or Google Video AI via `--scene-backend videoai`)
   - If scene detection fails, it falls back to interval segmentation via `-t`
 - Timestamped links back to YouTube
 - Per-segment slide notes with transcript text and short AI summary
@@ -24,7 +24,7 @@ PySummary extracts YouTube transcripts, segments the video timeline, generates A
 PySummary builds timeline segments in this order of priority:
 
 1. YouTube chapters
-2. PySceneDetect scene boundaries
+2. Scene detection (`--scene-backend pyscenedetect` or `videoai`)
 3. Fixed interval fallback (`-t`)
 
 ### 1) Chapter-Based Segmentation (Preferred)
@@ -36,19 +36,24 @@ If the video metadata includes chapters (manual or automatic), PySummary uses ea
    - Segment titles come from chapter titles.
    - Thumbnails are extracted at chapter starts.
 
-### 2) PySceneDetect Segmentation (No Chapters)
+### 2) Scene Detection (No Chapters)
 
-If chapters are not present, PySummary runs PySceneDetect to find visual scene changes.
+If chapters are not present, PySummary runs scene detection. Two backends are available via `--scene-backend`:
 
-- What it does:
-   - Downloads a temporary lower-resolution video file.
-   - Detects scene boundaries using content-change analysis.
-   - Uses each detected scene start time as a segment boundary.
-   - Extracts thumbnails at those scene starts.
+#### `pyscenedetect` (default)
+- Downloads a temporary lower-resolution video file locally.
+- Detects scene boundaries using content-change analysis (no extra credentials needed).
+- Uses each detected scene start time as a segment boundary.
 
-- Why this helps:
-   - Segments follow visual transitions in the video.
-   - Produces more meaningful segment boundaries than fixed-time slicing.
+#### `videoai` — Google Video AI Shot Change Detection
+- Downloads a temporary lower-resolution video file locally.
+- Submits it to the [Google Video Intelligence API](https://cloud.google.com/video-intelligence) for managed shot-change detection.
+- Typically more accurate on hard cuts, fades, and professionally edited content.
+- Requires the `google-cloud-videointelligence` package and Google Cloud credentials:
+  ```bash
+  pip install google-cloud-videointelligence
+  gcloud auth application-default login   # or set GOOGLE_APPLICATION_CREDENTIALS
+  ```
 
 ### 3) `-t` Fallback Interval
 
@@ -61,7 +66,7 @@ If PySceneDetect cannot produce usable scene boundaries, PySummary falls back to
    python pysummary.py -t 60 dQw4w9WgXcQ
    ```
 
-In short: chapters are used when available, PySceneDetect is used when chapters are missing, and `-t` is the safety net if scene detection is unavailable or fails.
+In short: chapters are used when available, scene detection (PySceneDetect or Google Video AI) is used when chapters are missing, and `-t` is the safety net if scene detection is unavailable or fails.
 
 ## Installation
 
@@ -136,6 +141,9 @@ python pysummary.py -pdf -ppt -o "My Full Report" -t 120 dQw4w9WgXcQ
 - `-n`: skip thumbnail extraction
 - `-o <name>`, `--output-name <name>`: custom output base name
 - `-t <seconds>`: fallback interval (no chapters and no scenes)
+- `--scene-backend <backend>`: scene detection backend when no chapters are found
+  - `pyscenedetect` (default) — local analysis, no extra setup
+  - `videoai` — Google Video AI Shot Change Detection (requires `google-cloud-videointelligence` and GCP credentials)
 - `-h`, `--help`, `--usage`: show usage information
 
 ## Outputs
@@ -164,12 +172,14 @@ A fully custom detector using frame-difference metrics, HSV histogram comparison
 A deep-learning shot-boundary detector (TensorFlow/PyTorch) that consistently outperforms rule-based methods on hard cuts, fades, and dissolves. Best used as an "accuracy mode" for longer, professionally edited videos.
 
 #### Cloud Vision APIs
-Google Video AI and AWS Rekognition both provide managed shot detection. High quality with no local compute required, but add cost and network/privacy constraints — suitable for production deployments.
+Google Video AI is now supported via `--scene-backend videoai`. AWS Rekognition remains a future option. Both provide managed shot detection with no local compute required, but add cost and network/privacy constraints — suitable for production deployments.
 
-A future `--scene-backend` option could allow users to choose between these approaches:
+The `--scene-backend` option selects the scene detection engine. Currently supported: `pyscenedetect` and `videoai`. Planned future backends:
 ```bash
-python pysummary.py --scene-backend ffmpeg dQw4w9WgXcQ
-python pysummary.py --scene-backend transnet dQw4w9WgXcQ
+python pysummary.py --scene-backend pyscenedetect dQw4w9WgXcQ   # default
+python pysummary.py --scene-backend videoai dQw4w9WgXcQ         # Google Video AI
+python pysummary.py --scene-backend ffmpeg dQw4w9WgXcQ          # (planned)
+python pysummary.py --scene-backend transnet dQw4w9WgXcQ        # (planned)
 ```
 
 ## License

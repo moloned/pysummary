@@ -58,7 +58,23 @@ FFMPEG_RW_TIMEOUT_US = str(15 * 1_000_000)
 GENAI_TIMEOUT_SEC = 60
 GENAI_RETRIES = 2
 
-_stream_url_cache = {}
+# YouTube signed stream URLs expire after ~6 minutes; refresh before they go stale.
+STREAM_URL_TTL_SEC = 240
+_stream_url_cache = {}   # video_id -> (url, fetched_at_epoch)
+
+def _get_stream_url(video_id, ydl_opts, force_refresh=False):
+    """Return a valid (non-expired) stream URL, fetching a fresh one when needed."""
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    entry = _stream_url_cache.get(video_id)
+    if entry and not force_refresh:
+        cached_url, fetched_at = entry
+        if time.time() - fetched_at < STREAM_URL_TTL_SEC:
+            return cached_url
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+        stream_url = info['url']
+    _stream_url_cache[video_id] = (stream_url, time.time())
+    return stream_url
 
 def _sigalrm_timeout_handler(signum, frame):
     raise TimeoutError("Gemini request timed out")
@@ -209,12 +225,7 @@ def extract_frame(video_id, timestamp, output_path, thumb_num=None, thumb_total=
     }
 
     try:
-        stream_url = _stream_url_cache.get(video_id)
-        if not stream_url:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-                stream_url = info['url']
-                _stream_url_cache[video_id] = stream_url
+        stream_url = _get_stream_url(video_id, ydl_opts)
 
         # Placing -ss BEFORE -i is much faster as it performs a fast seek at the stream level
         # rather than decoding everything up to that point.
@@ -229,6 +240,12 @@ def extract_frame(video_id, timestamp, output_path, thumb_num=None, thumb_total=
             '-y',
             '-loglevel', 'error'
         ]
+
+        # Patterns in ffmpeg stderr that indicate the stream URL has expired or the
+        # connection dropped — in these cases we refresh the URL rather than retrying
+        # the same stale URL.
+        _CONN_ERR = ('Connection timed out', 'IO error', 'Error opening input',
+                     '403', 'Forbidden', 'Error in the pull function')
 
         counter = f" [{thumb_num}/{thumb_total}]" if thumb_num is not None and thumb_total is not None else ""
         print(f"  [Thumbnail{counter}] Extracting frame at {_fmt_ts(timestamp)}...")
@@ -251,31 +268,26 @@ def extract_frame(video_id, timestamp, output_path, thumb_num=None, thumb_total=
                     print(f"  [Thumbnail{counter}] Done in {duration:.2f}s")
                     return True
 
-                # Expired stream URLs can fail mid-run; clear cache so next attempt refreshes URL.
+                err = result.stderr.decode('utf-8', errors='ignore')
+                conn_error = any(p in err for p in _CONN_ERR)
                 if attempt < FRAME_EXTRACT_RETRIES:
-                    _stream_url_cache.pop(video_id, None)
-                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                        info = ydl.extract_info(url, download=False)
-                        stream_url = info['url']
-                        _stream_url_cache[video_id] = stream_url
+                    # Always force-refresh URL on retry; essential when URL expired.
+                    reason = 'connection error' if conn_error else f'exit {result.returncode}'
+                    print(f"  [Thumbnail{counter}] Failed ({reason}) after {duration:.2f}s; refreshing URL and retrying ({attempt + 1}/{FRAME_EXTRACT_RETRIES})...")
+                    stream_url = _get_stream_url(video_id, ydl_opts, force_refresh=True)
                     cmd[6] = stream_url
                 else:
-                    err = result.stderr.decode('utf-8', errors='ignore').strip()
                     print(f"  [Thumbnail{counter}] Failed after {duration:.2f}s (ffmpeg exit {result.returncode})")
-                    if err:
-                        print(f"    ffmpeg: {err[:200]}")
+                    if err.strip():
+                        print(f"    ffmpeg: {err.strip()[:200]}")
 
             except subprocess.TimeoutExpired:
                 duration = time.time() - start_time
                 stats["ffmpeg_total_time"] += duration
                 stats["ffmpeg_calls"] += 1
                 if attempt < FRAME_EXTRACT_RETRIES:
-                    print(f"  [Thumbnail{counter}] Timeout after {duration:.2f}s; retrying ({attempt + 1}/{FRAME_EXTRACT_RETRIES})...")
-                    _stream_url_cache.pop(video_id, None)
-                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                        info = ydl.extract_info(url, download=False)
-                        stream_url = info['url']
-                        _stream_url_cache[video_id] = stream_url
+                    print(f"  [Thumbnail{counter}] Timeout after {duration:.2f}s; refreshing URL and retrying ({attempt + 1}/{FRAME_EXTRACT_RETRIES})...")
+                    stream_url = _get_stream_url(video_id, ydl_opts, force_refresh=True)
                     cmd[6] = stream_url
                 else:
                     print(f"  [Thumbnail{counter}] Timeout after {duration:.2f}s; skipping this thumbnail")
@@ -351,6 +363,70 @@ def detect_scene_timestamps(video_id):
             except OSError:
                 pass
 
+def detect_scene_timestamps_video_ai(video_id):
+    """Detect shot boundaries using Google Video AI Shot Change Detection.
+
+    Requires google-cloud-videointelligence and Application Default Credentials
+    (or GOOGLE_APPLICATION_CREDENTIALS env var pointing to a service-account JSON).
+    """
+    try:
+        from google.cloud import videointelligence
+    except ImportError:
+        print("  [VideoAI] google-cloud-videointelligence is not installed.")
+        print("  [VideoAI] Run: pip install google-cloud-videointelligence")
+        return []
+
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    temp_path = os.path.join(tempfile.gettempdir(), f"pysummary_{video_id}.mp4")
+
+    print("  [VideoAI] Downloading temporary video for shot detection...")
+    ydl_opts = {
+        'format': 'mp4[height<=480]/best[ext=mp4]/best',
+        'outtmpl': temp_path,
+        'quiet': True,
+        'no_warnings': True,
+        'noplaylist': True,
+        'overwrites': True,
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+
+        print("  [VideoAI] Sending video to Google Video Intelligence API...")
+        with open(temp_path, 'rb') as f:
+            input_content = f.read()
+
+        client = videointelligence.VideoIntelligenceServiceClient()
+        features = [videointelligence.Feature.SHOT_CHANGE_DETECTION]
+        operation = client.annotate_video(
+            request={"features": features, "input_content": input_content}
+        )
+        print("  [VideoAI] Waiting for shot analysis to complete (this may take a minute)...")
+        result = operation.result(timeout=600)
+
+        shot_annotations = result.annotation_results[0].shot_annotations
+        scene_starts = []
+        for shot in shot_annotations:
+            start_sec = int(
+                shot.start_time_offset.seconds
+                + shot.start_time_offset.microseconds / 1_000_000
+            )
+            if not scene_starts or start_sec > scene_starts[-1]:
+                scene_starts.append(start_sec)
+
+        print(f"  [VideoAI] Found {len(scene_starts)} shots")
+        return scene_starts
+    except Exception as e:
+        print(f"  [VideoAI] Error: {e}")
+        return []
+    finally:
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+
 def main():
     # Parse arguments
     generate_pdf = "-pdf" in sys.argv
@@ -379,6 +455,19 @@ def main():
         except (ValueError, IndexError):
             pass
 
+    scene_backend = "pyscenedetect"
+    if "--scene-backend" in sys.argv:
+        try:
+            sb_idx = sys.argv.index("--scene-backend")
+            scene_backend = sys.argv[sb_idx + 1].lower()
+            if scene_backend not in ("pyscenedetect", "videoai"):
+                print(f"Error: unknown --scene-backend '{scene_backend}'. "
+                      "Choose 'pyscenedetect' or 'videoai'.")
+                sys.exit(1)
+        except IndexError:
+            print("Error: --scene-backend requires a value (pyscenedetect or videoai)")
+            sys.exit(1)
+
     args_to_remove = ["-pdf", "-ppt", "-n"]
     if custom_name:
         if "-o" in sys.argv:
@@ -387,6 +476,8 @@ def main():
             args_to_remove.extend(["--output-name", custom_name])
     if "-t" in sys.argv:
         args_to_remove.extend(["-t", str(thumb_interval)])
+    if "--scene-backend" in sys.argv:
+        args_to_remove.extend(["--scene-backend", scene_backend])
 
     args = [arg for arg in sys.argv[1:] if arg not in args_to_remove]
 
@@ -399,24 +490,30 @@ Usage:
   python pysummary.py [OPTIONS] <YouTube URL or Video ID>
 
 Options:
-  -pdf                      Generate a PDF report
-  -ppt                      Generate a PowerPoint presentation
-  -n                        Skip thumbnail extraction (faster, text-only)
-  -o, --output-name <name>  Custom base name for output files (default: video ID)
-  -t <seconds>              Fallback thumbnail interval when no chapters or
-                            scene detection fails (default: 90)
-  -h, --help, --usage       Show this help message
+  -pdf                          Generate a PDF report
+  -ppt                          Generate a PowerPoint presentation
+  -n                            Skip thumbnail extraction (faster, text-only)
+  -o, --output-name <name>      Custom base name for output files (default: video ID)
+  -t <seconds>                  Fallback thumbnail interval when no chapters or
+                                scene detection fails (default: 90)
+  --scene-backend <backend>     Scene detection backend when no chapters found.
+                                  pyscenedetect  (default) local analysis, no extra auth
+                                  videoai        Google Video AI Shot Change Detection
+                                                 (requires google-cloud-videointelligence
+                                                  and Application Default Credentials)
+  -h, --help, --usage           Show this help message
 
 Segmentation strategy (in priority order):
-  1. YouTube chapters  — used when present
-  2. PySceneDetect     — used when chapters are absent
-  3. Interval (-t)     — used when scene detection fails
+  1. YouTube chapters   — used when present
+  2. Scene detection    — PySceneDetect or Google Video AI (--scene-backend)
+  3. Interval (-t)      — used when scene detection fails
 
 Examples:
   python pysummary.py dQw4w9WgXcQ
   python pysummary.py -pdf -ppt dQw4w9WgXcQ
   python pysummary.py -o "My Report" -pdf dQw4w9WgXcQ
   python pysummary.py -n -t 60 dQw4w9WgXcQ
+  python pysummary.py --scene-backend videoai dQw4w9WgXcQ
 """)
         sys.exit(0 if (not args or "--usage" in sys.argv or "--help" in sys.argv or "-h" in sys.argv) else 1)
 
@@ -466,12 +563,18 @@ Examples:
                     'text': ''
                 })
         else:
-            print("--- No chapters. Using PySceneDetect for segmentation ---")
-            scene_starts = detect_scene_timestamps(vid_id)
+            if scene_backend == "videoai":
+                print("--- No chapters. Using Google Video AI for segmentation ---")
+                scene_starts = detect_scene_timestamps_video_ai(vid_id)
+                backend_label = "VideoAI"
+            else:
+                print("--- No chapters. Using PySceneDetect for segmentation ---")
+                scene_starts = detect_scene_timestamps(vid_id)
+                backend_label = "PySceneDetect"
 
             # Fallback to interval sampling if scene detection fails.
             if not scene_starts:
-                print(f"  [PySceneDetect] No scenes detected. Falling back to every {thumb_interval}s.")
+                print(f"  [{backend_label}] No scenes detected. Falling back to every {thumb_interval}s.")
                 last_t = -thumb_interval
                 for seg in data:
                     if seg['start'] - last_t >= thumb_interval:

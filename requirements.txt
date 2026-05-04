@@ -10,3 +10,4 @@ opencv-python
 numpy
 scenedetect
 pillow
+google-cloud-videointelligence
