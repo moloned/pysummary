@@ -10,6 +10,7 @@ ENV/
 .env
 
 # Project Specific
+AGENTS.md
 transcript_*.md
 transcript_*.pdf
 *.pdf
@@ -18,3 +19,9 @@ transcript_*.pdf
 # IDEs
 .vscode/
 .idea/
+
+# Generated output directories
+SAM GUARD*/
+dQw4w9WgXcQ/
+thumbs_*/
+*_Webinar*/

@@ -1,0 +1,12 @@
+google-genai
+youtube-transcript-api
+yt-dlp
+requests
+python-dotenv
+markdown-it-py
+weasyprint
+python-pptx
+opencv-python
+numpy
+scenedetect
+pillow

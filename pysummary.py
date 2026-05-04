@@ -1,20 +1,46 @@
 import sys
 import re
 import os
+import logging
+import signal
 import requests
 import yt_dlp
 import subprocess
 import time
+import tempfile
+import cv2
+import numpy as np
 from dotenv import load_dotenv
 from google import genai
+
+# Suppress the "Both GOOGLE_API_KEY and GEMINI_API_KEY are set" warning
+logging.getLogger('google.auth._default').setLevel(logging.ERROR)
+logging.getLogger('google.auth').setLevel(logging.ERROR)
+logging.getLogger('google.genai').setLevel(logging.ERROR)
 from youtube_transcript_api import YouTubeTranscriptApi as yta
 from markdown_it import MarkdownIt
 from weasyprint import HTML
 from pptx import Presentation
 from pptx.util import Inches
+from scenedetect import open_video, SceneManager
+from scenedetect.detectors import ContentDetector
 
 # Load environment variables (for API key)
 load_dotenv()
+# If both keys are present the google-genai library prints a noisy warning.
+# We always use GEMINI_API_KEY explicitly, so remove GOOGLE_API_KEY.
+os.environ.pop('GOOGLE_API_KEY', None)
+
+# Shared genai client (created once to avoid per-call warnings)
+_genai_client = None
+
+def _get_genai_client():
+    global _genai_client
+    if _genai_client is None:
+        api_key = os.getenv("GEMINI_API_KEY")
+        if api_key:
+            _genai_client = genai.Client(api_key=api_key)
+    return _genai_client
 
 # Global statistics
 stats = {
@@ -23,6 +49,32 @@ stats = {
     "tokens_prompt": 0,
     "tokens_response": 0
 }
+
+# Thumbnail extraction safeguards to prevent hangs on network stalls.
+FRAME_EXTRACT_TIMEOUT_SEC = 45
+FRAME_EXTRACT_RETRIES = 2
+YTDLP_SOCKET_TIMEOUT_SEC = 15
+FFMPEG_RW_TIMEOUT_US = str(15 * 1_000_000)
+GENAI_TIMEOUT_SEC = 60
+GENAI_RETRIES = 2
+
+_stream_url_cache = {}
+
+def _sigalrm_timeout_handler(signum, frame):
+    raise TimeoutError("Gemini request timed out")
+
+def _call_with_timeout(timeout_sec, func, *args, **kwargs):
+    if timeout_sec <= 0 or not hasattr(signal, 'setitimer'):
+        return func(*args, **kwargs)
+
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    signal.signal(signal.SIGALRM, _sigalrm_timeout_handler)
+    signal.setitimer(signal.ITIMER_REAL, timeout_sec)
+    try:
+        return func(*args, **kwargs)
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
 
 def get_video_id(input_str):
     """
@@ -40,115 +92,333 @@ def get_video_id(input_str):
         
     return None
 
+def get_video_chapters(video_id):
+    """
+    Fetch chapter info from YouTube via yt-dlp.
+    Returns list of {'title', 'start_time', 'end_time'} dicts, or [].
+    """
+    print(f"  [Chapters] Fetching chapter data for {video_id}...")
+    ydl_opts = {'quiet': True, 'no_warnings': True, 'extract_flat': False}
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+            source = info.get('chapters') or info.get('automatic_chapters') or []
+            if source:
+                label = 'chapters' if info.get('chapters') else 'automatic chapters'
+                print(f"  [Chapters] Found {len(source)} {label}")
+                return [
+                    {
+                        'title': ch.get('title', f"Chapter {i+1}"),
+                        'start_time': ch.get('start_time', 0),
+                        'end_time': ch.get('end_time', 0)
+                    }
+                    for i, ch in enumerate(source)
+                ]
+            print("  [Chapters] No chapters found")
+            return []
+    except Exception as e:
+        print(f"  [Chapters] Error: {e}")
+        return []
+
+def calculate_frame_difference(img_path1, img_path2):
+    """
+    Compare two saved JPEG frames using HSV histogram correlation.
+    Returns a difference score from 0 (identical) to 100 (completely different).
+    """
+    frame1 = cv2.imread(img_path1)
+    frame2 = cv2.imread(img_path2)
+    if frame1 is None or frame2 is None:
+        return 100
+    h = min(frame1.shape[0], frame2.shape[0])
+    w = min(frame1.shape[1], frame2.shape[1])
+    f1 = cv2.resize(frame1, (w, h))
+    f2 = cv2.resize(frame2, (w, h))
+    hsv1 = cv2.cvtColor(f1, cv2.COLOR_BGR2HSV)
+    hsv2 = cv2.cvtColor(f2, cv2.COLOR_BGR2HSV)
+    hist1 = cv2.calcHist([hsv1], [0, 1], None, [180, 256], [0, 180, 0, 256])
+    hist2 = cv2.calcHist([hsv2], [0, 1], None, [180, 256], [0, 180, 0, 256])
+    cv2.normalize(hist1, hist1, 0, 1, cv2.NORM_MINMAX)
+    cv2.normalize(hist2, hist2, 0, 1, cv2.NORM_MINMAX)
+    similarity = cv2.compareHist(hist1, hist2, cv2.HISTCMP_CORREL)
+    return (1 - max(0, similarity)) * 100
+
 def generate_summary(text, segment=False):
     """
     Generates a summary of the transcript using Gemma (via Google Generative AI).
     Supports either an API key or a local setup if configured.
     """
-    api_key = os.getenv("GEMINI_API_KEY")
-    
-    if not api_key:
+    client = _get_genai_client()
+
+    if not client:
         return "Summary not generated: GEMINI_API_KEY environment variable not found."
 
-    try:
-        client = genai.Client(api_key=api_key)
-        # Using the specific Gemma model requested: gemma-4-31b-it
-        if segment:
-            prompt = f"Please provide a very brief, one-sentence summary of this specific video segment transcript:\n\n{text}"
-        else:
-            prompt = f"Please provide a concise summary of the following YouTube transcript:\n\n{text}"
-            
-        response = client.models.generate_content(
-            model='models/gemma-4-31b-it',
-            contents=prompt
-        )
-        
-        # Track tokens if metadata is available
-        if hasattr(response, 'usage_metadata'):
-            stats["tokens_prompt"] += response.usage_metadata.prompt_token_count
-            stats["tokens_response"] += response.usage_metadata.candidates_token_count
-            
-        return response.text
-    except Exception as e:
-        return f"Error generating summary: {e}"
+    # Using the specific Gemma model requested: gemma-4-31b-it
+    if segment:
+        prompt = f"Please provide a very brief, one-sentence summary of this specific video segment transcript:\n\n{text}"
+        summary_scope = "segment"
+    else:
+        prompt = f"Please provide a concise summary of the following YouTube transcript:\n\n{text}"
+        summary_scope = "full transcript"
 
-def extract_frame(video_id, timestamp, output_path):
+    last_error = None
+    for attempt in range(1, GENAI_RETRIES + 1):
+        try:
+            response = _call_with_timeout(
+                GENAI_TIMEOUT_SEC,
+                client.models.generate_content,
+                model='models/gemma-4-31b-it',
+                contents=prompt,
+            )
+
+            # Track tokens if metadata is available
+            if hasattr(response, 'usage_metadata'):
+                stats["tokens_prompt"] += response.usage_metadata.prompt_token_count
+                stats["tokens_response"] += response.usage_metadata.candidates_token_count
+
+            if getattr(response, 'text', None):
+                return response.text
+            return "Summary not generated: empty model response."
+        except TimeoutError:
+            last_error = f"timed out after {GENAI_TIMEOUT_SEC}s"
+            if attempt < GENAI_RETRIES:
+                print(f"  [AI] {summary_scope} summary timeout ({attempt}/{GENAI_RETRIES}), retrying...")
+            else:
+                print(f"  [AI] {summary_scope} summary timeout after {GENAI_RETRIES} attempt(s); continuing")
+        except Exception as e:
+            last_error = str(e)
+            if attempt < GENAI_RETRIES:
+                print(f"  [AI] {summary_scope} summary error ({attempt}/{GENAI_RETRIES}): {e}; retrying...")
+            else:
+                print(f"  [AI] {summary_scope} summary failed after {GENAI_RETRIES} attempt(s): {e}")
+
+    return f"Summary not generated: {last_error}"
+
+def extract_frame(video_id, timestamp, output_path, thumb_num=None, thumb_total=None):
     """
     Extracts a single frame from the YouTube video stream at the specified timestamp.
     Optimized to use faster seek and reduce connection time.
     """
     url = f"https://www.youtube.com/watch?v={video_id}"
-    
+
     ydl_opts = {
         'format': 'bestvideo[height<=480]', # Lower resolution for faster extraction
         'quiet': True,
         'no_warnings': True,
+        'noplaylist': True,
+        'socket_timeout': YTDLP_SOCKET_TIMEOUT_SEC,
     }
-    
+
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            print(f"  [FFmpeg] Getting stream URL for {video_id}...")
-            info = ydl.extract_info(url, download=False)
-            stream_url = info['url']
-            
-            # Placing -ss BEFORE -i is much faster as it performs a fast seek at the stream level
-            # rather than decoding everything up to that point.
-            cmd = [
-                'ffmpeg', 
-                '-ss', str(timestamp), 
-                '-i', stream_url, 
-                '-vframes', '1', 
-                '-q:v', '5', # Slightly lower quality (5 vs 2) for faster encoding
-                output_path, 
-                '-y',
-                '-loglevel', 'error'
-            ]
-            
-            print(f"  [FFmpeg] Extracting frame at {timestamp}s...")
+        stream_url = _stream_url_cache.get(video_id)
+        if not stream_url:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                stream_url = info['url']
+                _stream_url_cache[video_id] = stream_url
+
+        # Placing -ss BEFORE -i is much faster as it performs a fast seek at the stream level
+        # rather than decoding everything up to that point.
+        cmd = [
+            'ffmpeg',
+            '-rw_timeout', FFMPEG_RW_TIMEOUT_US,
+            '-ss', str(timestamp),
+            '-i', stream_url,
+            '-vframes', '1',
+            '-q:v', '5', # Slightly lower quality (5 vs 2) for faster encoding
+            output_path,
+            '-y',
+            '-loglevel', 'error'
+        ]
+
+        counter = f" [{thumb_num}/{thumb_total}]" if thumb_num is not None and thumb_total is not None else ""
+        print(f"  [Thumbnail{counter}] Extracting frame at {_fmt_ts(timestamp)}...")
+
+        for attempt in range(1, FRAME_EXTRACT_RETRIES + 1):
             start_time = time.time()
-            subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            duration = time.time() - start_time
-            print(f"  [FFmpeg] Done in {duration:.2f}s")
-            
-            stats["ffmpeg_total_time"] += duration
-            stats["ffmpeg_calls"] += 1
-            
-            return os.path.exists(output_path)
+            try:
+                result = subprocess.run(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=FRAME_EXTRACT_TIMEOUT_SEC,
+                    check=False,
+                )
+                duration = time.time() - start_time
+                stats["ffmpeg_total_time"] += duration
+                stats["ffmpeg_calls"] += 1
+
+                if result.returncode == 0 and os.path.exists(output_path):
+                    print(f"  [Thumbnail{counter}] Done in {duration:.2f}s")
+                    return True
+
+                # Expired stream URLs can fail mid-run; clear cache so next attempt refreshes URL.
+                if attempt < FRAME_EXTRACT_RETRIES:
+                    _stream_url_cache.pop(video_id, None)
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        info = ydl.extract_info(url, download=False)
+                        stream_url = info['url']
+                        _stream_url_cache[video_id] = stream_url
+                    cmd[6] = stream_url
+                else:
+                    err = result.stderr.decode('utf-8', errors='ignore').strip()
+                    print(f"  [Thumbnail{counter}] Failed after {duration:.2f}s (ffmpeg exit {result.returncode})")
+                    if err:
+                        print(f"    ffmpeg: {err[:200]}")
+
+            except subprocess.TimeoutExpired:
+                duration = time.time() - start_time
+                stats["ffmpeg_total_time"] += duration
+                stats["ffmpeg_calls"] += 1
+                if attempt < FRAME_EXTRACT_RETRIES:
+                    print(f"  [Thumbnail{counter}] Timeout after {duration:.2f}s; retrying ({attempt + 1}/{FRAME_EXTRACT_RETRIES})...")
+                    _stream_url_cache.pop(video_id, None)
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        info = ydl.extract_info(url, download=False)
+                        stream_url = info['url']
+                        _stream_url_cache[video_id] = stream_url
+                    cmd[6] = stream_url
+                else:
+                    print(f"  [Thumbnail{counter}] Timeout after {duration:.2f}s; skipping this thumbnail")
+
+        return False
     except Exception as e:
         print(f"Frame extraction failed for {timestamp}s: {e}")
         return False
+
+def _fmt_ts(seconds):
+    """Format seconds as [HH:MM:SS] or [MM:SS]."""
+    minutes, secs = divmod(int(seconds), 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours > 0:
+        return f"[{hours:02d}:{minutes:02d}:{secs:02d}]"
+    return f"[{minutes:02d}:{secs:02d}]"
+
+def strip_markdown(text):
+    """Remove common markdown formatting for use in PowerPoint text frames."""
+    text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)
+    text = re.sub(r'\*(.*?)\*', r'\1', text)
+    text = re.sub(r'__(.*?)__', r'\1', text)
+    text = re.sub(r'_(.*?)_', r'\1', text)
+    text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
+    text = re.sub(r'`(.*?)`', r'\1', text)
+    text = re.sub(r'^\s*[-*]\s+', '', text, flags=re.MULTILINE)
+    return text.strip()
+
+def detect_scene_timestamps(video_id):
+    """Detect scene start timestamps (in seconds) using PySceneDetect."""
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    temp_path = os.path.join(tempfile.gettempdir(), f"pysummary_{video_id}.mp4")
+
+    print("  [PySceneDetect] Downloading temporary video for scene detection...")
+    ydl_opts = {
+        'format': 'mp4[height<=480]/best[ext=mp4]/best',
+        'outtmpl': temp_path,
+        'quiet': True,
+        'no_warnings': True,
+        'noplaylist': True,
+        'overwrites': True,
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+
+        video = open_video(temp_path)
+        fps = video.frame_rate if getattr(video, 'frame_rate', None) else 30.0
+        min_scene_len_frames = max(15, int(2.0 * fps))
+
+        manager = SceneManager()
+        manager.add_detector(ContentDetector(min_scene_len=min_scene_len_frames))
+        print("  [PySceneDetect] Detecting scene boundaries...")
+        manager.detect_scenes(video)
+
+        scene_list = manager.get_scene_list()
+        scene_starts = []
+        for start_time, _ in scene_list:
+            start_seconds = int(start_time.get_seconds())
+            if not scene_starts or start_seconds > scene_starts[-1]:
+                scene_starts.append(start_seconds)
+
+        print(f"  [PySceneDetect] Found {len(scene_starts)} scenes")
+        return scene_starts
+    except Exception as e:
+        print(f"  [PySceneDetect] Error: {e}")
+        return []
+    finally:
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
 
 def main():
     # Parse arguments
     generate_pdf = "-pdf" in sys.argv
     generate_ppt = "-ppt" in sys.argv
     no_thumbnails = "-n" in sys.argv
-    
+
     custom_name = None
-    if "-name" in sys.argv:
+    if "-o" in sys.argv:
         try:
-            name_idx = sys.argv.index("-name")
+            name_idx = sys.argv.index("-o")
+            custom_name = sys.argv[name_idx + 1]
+        except (ValueError, IndexError):
+            pass
+    elif "--output-name" in sys.argv:
+        try:
+            name_idx = sys.argv.index("--output-name")
             custom_name = sys.argv[name_idx + 1]
         except (ValueError, IndexError):
             pass
 
-    # Filter out known flags and their values
+    thumb_interval = 90
+    if "-t" in sys.argv:
+        try:
+            t_idx = sys.argv.index("-t")
+            thumb_interval = int(sys.argv[t_idx + 1])
+        except (ValueError, IndexError):
+            pass
+
     args_to_remove = ["-pdf", "-ppt", "-n"]
-    if "-name" in sys.argv:
-        args_to_remove.append("-name")
-        if custom_name:
-            args_to_remove.append(custom_name)
-            
+    if custom_name:
+        if "-o" in sys.argv:
+            args_to_remove.extend(["-o", custom_name])
+        if "--output-name" in sys.argv:
+            args_to_remove.extend(["--output-name", custom_name])
+    if "-t" in sys.argv:
+        args_to_remove.extend(["-t", str(thumb_interval)])
+
     args = [arg for arg in sys.argv[1:] if arg not in args_to_remove]
 
-    if not args:
-        print("Usage: python pysummary.py [-pdf] [-ppt] [-n] [-name <filename>] <YouTube URL or Video ID>")
-        print("Options:")
-        print("  -pdf             Generate a PDF document")
-        print("  -ppt             Generate a PowerPoint presentation")
-        print("  -n               Skip thumbnail extraction (faster execution)")
-        print("  -name <string>   Custom name for output files (instead of Video ID)")
-        sys.exit(1)
+    show_usage = not args or "--usage" in sys.argv or "--help" in sys.argv or "-h" in sys.argv
+    if show_usage:
+        print("""
+PySummary — YouTube transcript extractor and AI summariser
+
+Usage:
+  python pysummary.py [OPTIONS] <YouTube URL or Video ID>
+
+Options:
+  -pdf                      Generate a PDF report
+  -ppt                      Generate a PowerPoint presentation
+  -n                        Skip thumbnail extraction (faster, text-only)
+  -o, --output-name <name>  Custom base name for output files (default: video ID)
+  -t <seconds>              Fallback thumbnail interval when no chapters or
+                            scene detection fails (default: 90)
+  -h, --help, --usage       Show this help message
+
+Segmentation strategy (in priority order):
+  1. YouTube chapters  — used when present
+  2. PySceneDetect     — used when chapters are absent
+  3. Interval (-t)     — used when scene detection fails
+
+Examples:
+  python pysummary.py dQw4w9WgXcQ
+  python pysummary.py -pdf -ppt dQw4w9WgXcQ
+  python pysummary.py -o "My Report" -pdf dQw4w9WgXcQ
+  python pysummary.py -n -t 60 dQw4w9WgXcQ
+""")
+        sys.exit(0 if (not args or "--usage" in sys.argv or "--help" in sys.argv or "-h" in sys.argv) else 1)
 
     input_arg = args[0]
     vid_id = get_video_id(input_arg)
@@ -157,102 +427,156 @@ def main():
         print(f"Error: Could not extract video ID from '{input_arg}'")
         sys.exit(1)
 
-    # Use custom name or video ID for directory and files
     base_name = custom_name if custom_name else vid_id
-    thumbs_dir = f"thumbs_{base_name}"
-    os.makedirs(thumbs_dir, exist_ok=True)
+    out_dir = base_name
+    thumbs_dir = out_dir  # thumbnails go into the same output directory
+    os.makedirs(out_dir, exist_ok=True)
+    print(f"Output directory: {out_dir}/")
+
+    # Fetch YouTube chapters
+    chapters = get_video_chapters(vid_id)
 
     try:
-        # In newer versions, YouTubeTranscriptApi is an object that needs instantiation
         print(f"Fetching transcript for {vid_id}...")
         api = yta()
         transcript = api.fetch(vid_id)
-        
-        # In version 1.2.4, FetchedTranscript has a 'snippets' attribute
-        # which is a list of FetchedTranscriptSnippet (which are essentially dicts)
-        # or we can use to_raw_data()
         data = transcript.to_raw_data()
         print(f"Transcript fetched. Found {len(data)} segments.")
-        
-        # Add a header image to the .md file (Main Thumbnail)
-        main_thumbnail = f"![Thumbnail](https://img.youtube.com/vi/{vid_id}/maxresdefault.jpg)"
-        
-        # Format transcript with timestamps
-        formatted_lines = []
-        # Store segments for PPT generation
-        ppt_slides_data = []
-        
-        # Limiting thumbnails to avoid too many downloads for long videos
-        # We can take a thumbnail every 60 seconds or so
-        last_thumb_time = -70 
 
-        print("Processing transcript segments...")
-        for i, segment in enumerate(data):
-            start_time = segment['start']
-            duration = segment.get('duration', 0)
-            end_time = start_time + duration
-            # Convert decimal seconds to MM:SS or HH:MM:SS format
-            minutes, seconds = divmod(int(start_time), 60)
-            hours, minutes = divmod(minutes, 60)
-            
-            if hours > 0:
-                timestamp_str = f"[{hours:02d}:{minutes:02d}:{seconds:02d}]"
-            else:
-                timestamp_str = f"[{minutes:02d}:{seconds:02d}]"
-                
-            jump_url = f"https://youtu.be/{vid_id}?t={int(start_time)}"
-            text = segment['text'].replace('\n', ' ').strip()
-            
-            # Simple heuristic to include a thumbnail every ~60 seconds
-            if start_time - last_thumb_time >= 60:
-                current_thumb_path = None
-                if not no_thumbnails:
-                    print(f"  [{i}/{len(data)}] Processing thumbnail at {timestamp_str}...")
-                    thumb_name = f"thumb_{int(start_time)}.jpg"
-                    current_thumb_path = os.path.join(thumbs_dir, thumb_name)
-                    
-                    if not os.path.exists(current_thumb_path):
-                        # Try to extract the real frame from the video stream
-                        success = extract_frame(vid_id, int(start_time), current_thumb_path)
-                        
-                        # Fallback to HQ thumbnail if extraction fails
-                        if not success:
-                            print(f"  [Fallback] Downloading HQ thumbnail for {timestamp_str}")
-                            r = requests.get(f"https://img.youtube.com/vi/{vid_id}/hqdefault.jpg")
-                            if r.status_code == 200:
-                                with open(current_thumb_path, 'wb') as f:
-                                    f.write(r.content)
-                    
-                    formatted_lines.append(f"![{timestamp_str}]({current_thumb_path})\n")
-                else:
-                    # Just add timestamp if thumbnails are disabled
-                    formatted_lines.append(f"**{timestamp_str}**\n")
-                
-                # Start a new PPT slide entry
-                ppt_slides_data.append({
-                    "start_timestamp": timestamp_str,
-                    "end_timestamp": timestamp_str, # Will be updated by following segments
-                    "start_time": start_time,
-                    "end_time": end_time,
-                    "image": current_thumb_path,
-                    "text": text
+        transcript_end = data[-1]['start'] + data[-1].get('duration', 0) if data else 0
+
+        # ------------------------------------------------------------------
+        # Build segment list: each entry has start_time, end_time, title,
+        # image (path or None), text (transcript dialogue for that segment)
+        # ------------------------------------------------------------------
+        segments = []
+
+        if chapters:
+            print(f"--- Using {len(chapters)} YouTube chapters for segmentation ---")
+            for i, ch in enumerate(chapters):
+                start_s = ch['start_time']
+                # Use chapter end_time if valid, otherwise next chapter start or transcript end
+                end_s = ch['end_time'] if ch['end_time'] and ch['end_time'] > start_s \
+                    else (chapters[i + 1]['start_time'] if i + 1 < len(chapters) else transcript_end)
+                segments.append({
+                    'start_time': start_s,
+                    'end_time': end_s,
+                    'title': ch['title'],
+                    'image': None,
+                    'text': ''
                 })
-                last_thumb_time = start_time
+        else:
+            print("--- No chapters. Using PySceneDetect for segmentation ---")
+            scene_starts = detect_scene_timestamps(vid_id)
+
+            # Fallback to interval sampling if scene detection fails.
+            if not scene_starts:
+                print(f"  [PySceneDetect] No scenes detected. Falling back to every {thumb_interval}s.")
+                last_t = -thumb_interval
+                for seg in data:
+                    if seg['start'] - last_t >= thumb_interval:
+                        scene_starts.append(int(seg['start']))
+                        last_t = seg['start']
+
+            for i, ts in enumerate(scene_starts):
+                end_ts = scene_starts[i + 1] if i + 1 < len(scene_starts) else transcript_end
+                img_path = None
+
+                if not no_thumbnails:
+                    candidate_path = os.path.join(thumbs_dir, f"thumb_{int(ts)}.jpg")
+                    success = extract_frame(vid_id, int(ts), candidate_path, thumb_num=i + 1, thumb_total=len(scene_starts))
+                    if success:
+                        img_path = candidate_path
+
+                segments.append({
+                    'start_time': ts,
+                    'end_time': end_ts,
+                    'title': _fmt_ts(ts),
+                    'image': img_path,
+                    'text': ''
+                })
+
+        # Fallback: single segment covering everything
+        if not segments and data:
+            segments.append({
+                'start_time': data[0]['start'],
+                'end_time': transcript_end,
+                'title': '[00:00]',
+                'image': None,
+                'text': ''
+            })
+
+        # Assign transcript dialogue text to each segment
+        for i, seg in enumerate(segments):
+            seg_end = segments[i + 1]['start_time'] if i + 1 < len(segments) else float('inf')
+            seg['text'] = ' '.join(
+                s['text'].replace('\n', ' ').strip()
+                for s in data
+                if seg['start_time'] <= s['start'] < seg_end
+            )
+
+        # For chapter-based segments, extract thumbnails now
+        if chapters and not no_thumbnails:
+            print(f"Extracting {len(segments)} chapter thumbnail(s)...")
+            for i, seg in enumerate(segments):
+                ts = int(seg['start_time'])
+                img_path = os.path.join(thumbs_dir, f"thumb_{ts}.jpg")
+                if not os.path.exists(img_path):
+                    success = extract_frame(vid_id, ts, img_path, thumb_num=i + 1, thumb_total=len(segments))
+                    if not success:
+                        img_path = None
+                seg['image'] = img_path if img_path and os.path.exists(img_path) else None
+
+        # ------------------------------------------------------------------
+        # Build formatted output
+        # ------------------------------------------------------------------
+        main_thumbnail = f"![Thumbnail](https://img.youtube.com/vi/{vid_id}/maxresdefault.jpg)"
+        formatted_lines = []
+        ppt_slides_data = []
+
+        total_segments = len(segments)
+        print(f"Processing {total_segments} segment(s)...")
+        for seg_idx, seg in enumerate(segments, start=1):
+            start_time = seg['start_time']
+            end_time   = seg['end_time']
+            start_ts_str = _fmt_ts(start_time)
+            end_ts_str   = _fmt_ts(end_time)
+            jump_url     = f"https://youtu.be/{vid_id}?t={int(start_time)}"
+            title        = seg.get('title', start_ts_str)
+            img_path     = seg.get('image')
+            seg_text     = seg.get('text', '')
+            print(f"[{seg_idx}/{total_segments}] {title} {start_ts_str} — {end_ts_str}")
+
+            # Thumbnail or bold timestamp
+            if img_path and os.path.exists(img_path):
+                formatted_lines.append(f"![{start_ts_str}]({img_path})\n")
             else:
-                # Append text to the current PPT slide notes and update end timestamp
-                if ppt_slides_data:
-                    ppt_slides_data[-1]["text"] += " " + text
-                    ppt_slides_data[-1]["end_time"] = end_time
-                    
-                    # Update the end timestamp for the range
-                    end_minutes, end_seconds = divmod(int(end_time), 60)
-                    end_hours, end_minutes = divmod(end_minutes, 60)
-                    if end_hours > 0:
-                        ppt_slides_data[-1]["end_timestamp"] = f"[{end_hours:02d}:{end_minutes:02d}:{end_seconds:02d}]"
-                    else:
-                        ppt_slides_data[-1]["end_timestamp"] = f"[{end_minutes:02d}:{end_seconds:02d}]"
-            
-            formatted_lines.append(f"{timestamp_str} {text} ([link]({jump_url}))")
+                formatted_lines.append(f"**{start_ts_str}**\n")
+
+            # Section heading
+            formatted_lines.append(f"### {title} {start_ts_str} — {end_ts_str} ([link]({jump_url}))\n")
+
+            # Raw transcript dialogue for this segment
+            if seg_text:
+                formatted_lines.append(f"{seg_text}\n")
+
+            # AI segment summary
+            summary_segment = ''
+            if seg_text:
+                print(f"  Summarising segment {seg_idx}/{total_segments}...")
+                summary_segment = generate_summary(seg_text, segment=True)
+                formatted_lines.append(f"\n> {summary_segment}\n\n---\n")
+
+            ppt_slides_data.append({
+                "start_timestamp": start_ts_str,
+                "end_timestamp":   end_ts_str,
+                "start_time":      start_time,
+                "end_time":        end_time,
+                "title":           title,
+                "image":           img_path,
+                "text":            seg_text,
+                "summary":         summary_segment
+            })
 
         output_content = '\n'.join(formatted_lines)
         print("Transcript processing complete.")
@@ -280,7 +604,7 @@ def main():
             stats_block += "- **AI Tokens Used**: N/A (Response metadata not provided)\n"
 
         # Output to .md file
-        filename_md = f"transcript_{base_name}.md"
+        filename_md = os.path.join(out_dir, f"transcript_{base_name}.md")
         md_content = f"# Transcript and Summary for YouTube Video: {vid_id}\n\n" \
                      f"{main_thumbnail}\n\n" \
                      f"## Summary\n{summary}\n\n" \
@@ -295,7 +619,7 @@ def main():
         # PDF Generation
         if generate_pdf:
             print("\n--- Generating PDF ---")
-            filename_pdf = f"transcript_{base_name}.pdf"
+            filename_pdf = os.path.join(out_dir, f"transcript_{base_name}.pdf")
             
             # Use markdown-it-py to convert the EXSTING MD content to HTML
             md = MarkdownIt("commonmark", {
@@ -333,14 +657,14 @@ def main():
             </html>
             """
             
-            # Use the absolute path to the directory containing images as base_url
-            HTML(string=styled_html, base_url=os.path.join(cwd, thumbs_dir)).write_pdf(filename_pdf)
+            # Use the absolute path to the output directory as base_url so images resolve
+            HTML(string=styled_html, base_url=os.path.join(cwd, out_dir)).write_pdf(filename_pdf)
             print(f"Success: PDF saved to {filename_pdf}")
 
         # PPT Generation
         if generate_ppt:
             print("\n--- Generating PowerPoint ---")
-            filename_ppt = f"transcript_{base_name}.pptx"
+            filename_ppt = os.path.join(out_dir, f"transcript_{base_name}.pptx")
             prs = Presentation()
             
             # Download main thumbnail for title slide if possible
@@ -358,7 +682,7 @@ def main():
             slide = prs.slides.add_slide(title_slide_layout)
             title = slide.shapes.title
             subtitle = slide.placeholders[1]
-            title.text = f"Video Summary: {vid_id}"
+            title.text = f"Video Summary: {base_name}"
             
             subtitle_text = f"YouTube Link: https://youtu.be/{vid_id}\nGenerated on: {time.strftime('%Y-%m-%d %H:%M:%S')}"
             subtitle.text = subtitle_text
@@ -377,7 +701,8 @@ def main():
             slide.shapes.title.text = "AI Generated Summary"
             body_shape = slide.shapes.placeholders[1]
             tf = body_shape.text_frame
-            tf.text = summary if len(summary) < 1000 else summary[:1000] + "..."
+            summary_plain = strip_markdown(summary)
+            tf.text = summary_plain if len(summary_plain) < 1000 else summary_plain[:1000] + "..."
             tf.word_wrap = True
 
             # --- Transcript Slides ---
@@ -389,62 +714,78 @@ def main():
                 # Use a blank layout for maximum image space
                 blank_slide_layout = prs.slide_layouts[6]
                 slide = prs.slides.add_slide(blank_slide_layout)
-                
-                # Add image if available
-                if slide_data["image"] and os.path.exists(slide_data["image"]):
-                    # Center the image on the slide
-                    left = Inches(1)
-                    top = Inches(0.5)
-                    width = Inches(8) # Standard slide width is 10 inches
-                    slide.shapes.add_picture(slide_data["image"], left, top, width=width)
-                    
-                    # Add timestamp range below the thumbnail
-                    # 7.5 inches down is roughly below an 8-inch width image starting at 0.5 top
-                    txBox = slide.shapes.add_textbox(left, Inches(6.5), width, Inches(1))
-                    tf = txBox.text_frame
-                    p = tf.paragraphs[0]
-                    p.alignment = PP_ALIGN.CENTER
 
-                    # Add "Range: " prefix
-                    run = p.add_run()
-                    run.text = "Range: "
-                    run.font.size = Pt(18)
-                    run.font.color.rgb = RGBColor(0, 0, 0)
+                slide_title = slide_data.get('title', '')
+                has_image = bool(slide_data["image"] and os.path.exists(slide_data["image"]))
 
-                    # Add Start Timestamp with Link
-                    start_run = p.add_run()
-                    start_run.text = slide_data['start_timestamp']
-                    start_run.font.size = Pt(18)
-                    start_run.font.color.rgb = RGBColor(5, 99, 193) # Standard blue link color
-                    start_run.font.underline = True
-                    start_time_seconds = int(slide_data['start_time'])
-                    start_run.hyperlink.address = f"https://youtu.be/{vid_id}?t={start_time_seconds}"
+                # Slide dimensions: 10" x 7.5"
+                content_left = Inches(0.5)
+                img_left     = Inches(1)
+                content_width = Inches(9)
+                img_width    = Inches(8)
 
-                    # Add separator
-                    sep_run = p.add_run()
-                    sep_run.text = " - "
-                    sep_run.font.size = Pt(18)
-                    sep_run.font.color.rgb = RGBColor(0, 0, 0)
+                # --- Chapter / segment title (always shown) ---
+                if slide_title:
+                    title_box = slide.shapes.add_textbox(content_left, Inches(0.05), content_width, Inches(0.55))
+                    tf_title = title_box.text_frame
+                    tf_title.text = strip_markdown(slide_title)
+                    tf_title.paragraphs[0].alignment = PP_ALIGN.CENTER
+                    tf_title.paragraphs[0].runs[0].font.size = Pt(20)
+                    tf_title.paragraphs[0].runs[0].font.bold = True
 
-                    # Add End Timestamp with Link
-                    end_run = p.add_run()
-                    end_run.text = slide_data['end_timestamp']
-                    end_run.font.size = Pt(18)
-                    end_run.font.color.rgb = RGBColor(5, 99, 193)
-                    end_run.font.underline = True
-                    end_time_seconds = int(slide_data['end_time'])
-                    end_run.hyperlink.address = f"https://youtu.be/{vid_id}?t={end_time_seconds}"
-                
-                # Add timestamp and text to speaker notes
+                # --- Thumbnail image (starts below title, clear of overlap) ---
+                img_top = Inches(0.65)
+                if has_image:
+                    slide.shapes.add_picture(slide_data["image"], img_left, img_top, width=img_width)
+                else:
+                    # No image: show the segment AI summary as body text
+                    summary_text = strip_markdown(slide_data.get('summary', ''))
+                    if summary_text:
+                        body_box = slide.shapes.add_textbox(content_left, Inches(1.5), content_width, Inches(4.5))
+                        tf_body = body_box.text_frame
+                        tf_body.word_wrap = True
+                        tf_body.text = summary_text
+                        tf_body.paragraphs[0].runs[0].font.size = Pt(18)
+
+                # --- Timestamp range (always shown, clear of slide bottom) ---
+                txBox = slide.shapes.add_textbox(img_left, Inches(6.3), img_width, Inches(0.7))
+                tf = txBox.text_frame
+                p = tf.paragraphs[0]
+                p.alignment = PP_ALIGN.CENTER
+
+                run = p.add_run()
+                run.text = "Range: "
+                run.font.size = Pt(16)
+                run.font.color.rgb = RGBColor(0, 0, 0)
+
+                start_run = p.add_run()
+                start_run.text = slide_data['start_timestamp']
+                start_run.font.size = Pt(16)
+                start_run.font.color.rgb = RGBColor(5, 99, 193)
+                start_run.font.underline = True
+                start_run.hyperlink.address = f"https://youtu.be/{vid_id}?t={int(slide_data['start_time'])}"
+
+                sep_run = p.add_run()
+                sep_run.text = " — "
+                sep_run.font.size = Pt(16)
+                sep_run.font.color.rgb = RGBColor(0, 0, 0)
+
+                end_run = p.add_run()
+                end_run.text = slide_data['end_timestamp']
+                end_run.font.size = Pt(16)
+                end_run.font.color.rgb = RGBColor(5, 99, 193)
+                end_run.font.underline = True
+                end_run.hyperlink.address = f"https://youtu.be/{vid_id}?t={int(slide_data['end_time'])}"
+
+                # --- Speaker notes ---
                 notes_slide = slide.notes_slide
                 text_frame = notes_slide.notes_text_frame
-                
-                print(f"  Generating summary for slide {slide_data['start_timestamp']}...")
-                segment_summary = generate_summary(slide_data['text'], segment=True)
-                
-                text_frame.text = f"Range: {slide_data['start_timestamp']} - {slide_data['end_timestamp']}\n\n" \
-                                f"Segment Summary: {segment_summary}\n\n" \
-                                f"Transcript: {slide_data['text']}"
+                segment_summary = strip_markdown(slide_data.get('summary') or '')
+                text_frame.text = (
+                    f"Range: {slide_data['start_timestamp']} — {slide_data['end_timestamp']}\n\n"
+                    f"Segment Summary: {segment_summary}\n\n"
+                    f"Transcript: {slide_data['text']}"
+                )
             
             # --- Statistics Slide ---
             stats_slide_layout = prs.slide_layouts[1]
